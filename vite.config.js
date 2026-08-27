@@ -3501,6 +3501,11 @@ const CCTV_SOURCE_FETCH_TIMEOUT_MS = 15 * 1000;
  * client refresh cadence. A bounded miss can fall through to Street View or
  * the synthetic frame instead of leaving the browser preview pending. */
 export const CCTV_FRAME_FETCH_TIMEOUT_MS = 8 * 1000;
+/** Hard ceiling on one buffered snapshot frame. Public CCTV stills run well
+ * under a megabyte; 16 MB clears even a 4K PNG while keeping a hostile or
+ * misconfigured source from buffering an unbounded body into the proxy inside
+ * the 8-second window. Live media keeps its own, larger streamed cap. */
+export const CCTV_FRAME_MAX_BODY_BYTES = 16 * 1024 * 1024;
 /** @type {Array<object>} Cached merged + normalized CCTV source list. */
 let _cctvSourceCache = [];
 /** @type {number} Epoch-ms when the source cache was last refreshed. */
@@ -4367,6 +4372,39 @@ async function readCappedResponseText(upstream, maxBytes) {
   return { tooLarge: false, text };
 }
 
+/**
+ * Binary counterpart of readCappedResponseText: buffer a fetch Response body
+ * while enforcing a hard byte cap during the read. A declared Content-Length
+ * over the cap is refused before a single body byte is pulled; a missing or
+ * lying one is caught as chunks arrive and the stream is cancelled. Returns
+ * null on overflow so callers can treat oversize like any other upstream miss.
+ * @param {Response} upstream - fetch() response.
+ * @param {number} maxBytes - hard ceiling on body bytes.
+ * @returns {Promise<Buffer|null>} Buffered body, or null once the cap is crossed.
+ */
+async function readCappedResponseBytes(upstream, maxBytes) {
+  const declared = Number(upstream.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    try { await upstream.body?.cancel(); } catch { /* no-op */ }
+    return null;
+  }
+  if (!upstream.body || typeof upstream.body[Symbol.asyncIterator] !== 'function') {
+    const buffered = Buffer.from(await upstream.arrayBuffer());
+    return buffered.length > maxBytes ? null : buffered;
+  }
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of upstream.body) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      try { await upstream.body.cancel(); } catch { /* no-op */ }
+      return null;
+    }
+    chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+  }
+  return Buffer.concat(chunks, total);
+}
+
 async function proxyMediaResponse(res, upstream, { sourceHeader = 'upstream' } = {}) {
   const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
   const cacheControl = upstream.headers.get('cache-control') || 'no-store';
@@ -4415,15 +4453,21 @@ async function proxyMediaResponse(res, upstream, { sourceHeader = 'upstream' } =
  * continue through the Street View and synthetic fallback chain. `fetchImpl`
  * and `timeoutMs` are injectable only to keep the timeout contract unit-testable.
  *
+ * The body is capped while it is read, so a source that turns hostile (or is
+ * simply misconfigured) can't buffer an unbounded frame into the proxy inside
+ * the timeout window. An oversize body is a miss like any other.
+ *
  * @param {string} url - Server-registered upstream image URL.
  * @param {object} [options]
  * @param {typeof fetch} [options.fetchImpl=fetch] - Fetch implementation.
  * @param {number} [options.timeoutMs=CCTV_FRAME_FETCH_TIMEOUT_MS] - Abort timeout.
+ * @param {number} [options.maxBytes=CCTV_FRAME_MAX_BODY_BYTES] - Hard body cap.
  * @returns {Promise<{ok:true,body:Buffer,contentType:string}|null>}
  */
 export async function fetchCctvImageFromUpstream(url, {
   fetchImpl = fetch,
   timeoutMs = CCTV_FRAME_FETCH_TIMEOUT_MS,
+  maxBytes = CCTV_FRAME_MAX_BODY_BYTES,
 } = {}) {
   if (!url || !/^https?:\/\//i.test(url)) return null;
   const controller = new AbortController();
@@ -4437,11 +4481,9 @@ export async function fetchCctvImageFromUpstream(url, {
     });
     const contentType = upstream.headers.get('content-type') || '';
     if (!upstream.ok || !contentType.startsWith('image/')) return null;
-    return {
-      ok: true,
-      body: Buffer.from(await upstream.arrayBuffer()),
-      contentType,
-    };
+    const body = await readCappedResponseBytes(upstream, maxBytes);
+    if (!body) return null;
+    return { ok: true, body, contentType };
   } catch {
     return null;
   } finally {

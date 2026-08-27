@@ -115,6 +115,10 @@ represent previously published GitHub Releases.
 
 ### Security
 
+- The CCTV frame proxy caps one buffered snapshot at 16 MB while it reads. A
+  configured source that declares or streams a larger body is cancelled and
+  treated as an ordinary upstream miss, so the Street View and synthetic
+  fallbacks still run.
 - Production transitive dependencies resolve to patched DOMPurify and
   protobufjs releases without changing the Cesium version or application APIs.
 - Production dependency audit reports no known advisories; remaining audit
